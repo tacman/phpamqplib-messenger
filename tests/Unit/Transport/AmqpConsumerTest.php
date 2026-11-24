@@ -725,6 +725,7 @@ class AmqpConsumerTest extends TestCase
             ->willReturnOnConsecutiveCalls(true, false);
         $channel->expects(self::once())
             ->method('wait')
+            ->with(null, true)
             ->willReturnCallback(static function () use ($channel, $registeredTags): void {
                 self::assertSame(['consumer_tag'], $registeredTags());
 
@@ -738,6 +739,35 @@ class AmqpConsumerTest extends TestCase
         self::assertTrue($consumer->hasBufferedEnvelopes());
         // The temporary registration for the cancelled tag is removed again.
         self::assertSame([], $registeredTags());
+    }
+
+    public function testResubscribingRemovesTheTemporaryCallbackWhenFlushingFails(): void
+    {
+        $channel = $this->createStub(AMQPChannel::class);
+
+        $connection = $this->getTestConnectionStub();
+        $connection->method('consumerChannel')
+            ->willReturn($channel);
+
+        $consumer = $this->getTestConsumer(connection: $connection);
+
+        $channel->method('basic_consume')
+            ->willReturn('consumer_tag');
+        $channel->method('hasPendingMethods')
+            ->willReturn(true);
+        $channel->method('wait')
+            ->willThrowException(new AMQPTimeoutException());
+
+        $consumer->ensureStarted('test_queue');
+
+        try {
+            $consumer->ensureStarted('test_queue', 50);
+            self::fail('Expected the flush failure to propagate');
+        } catch (AMQPTimeoutException) {
+            // Expected.
+        }
+
+        self::assertSame([], array_keys((fn (): array => $this->callbacks)->call($channel)));
     }
 
     public function testResubscribingDoesNotSubscribeAgainWhenCancelFails(): void
