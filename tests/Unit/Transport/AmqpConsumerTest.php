@@ -664,6 +664,40 @@ class AmqpConsumerTest extends TestCase
         self::assertSame(['qos:20', 'consume', 'cancel', 'qos:50', 'consume'], $operations);
     }
 
+    public function testEnsureStartedSubscribesWithoutWaitingAndResubscribesWhenPrefetchGrows(): void
+    {
+        $channel = $this->createMock(AMQPChannel::class);
+
+        $connection = $this->getTestConnectionStub();
+        $connection->method('consumerChannel')
+            ->willReturn($channel);
+
+        $consumer = $this->getTestConsumer(connection: $connection);
+
+        $operations = [];
+        $channel->method('basic_qos')
+            ->willReturnCallback(static function (int $prefetchSize, int $prefetchCount, bool $aGlobal) use (&$operations): void {
+                $operations[] = 'qos:' . $prefetchCount;
+            });
+        $channel->method('basic_consume')
+            ->willReturnCallback(static function () use (&$operations): string {
+                $operations[] = 'consume';
+
+                return 'consumer_tag';
+            });
+        $channel->method('basic_cancel')
+            ->willReturnCallback(static function () use (&$operations): void {
+                $operations[] = 'cancel';
+            });
+        $channel->expects(self::never())->method('wait');
+
+        $consumer->ensureStarted('test_queue');
+        $consumer->ensureStarted('test_queue');
+        $consumer->ensureStarted('test_queue', 50);
+
+        self::assertSame(['qos:20', 'consume', 'cancel', 'qos:50', 'consume'], $operations);
+    }
+
     public function testStopConsumer(): void
     {
         $channel = $this->createMock(AMQPChannel::class);
