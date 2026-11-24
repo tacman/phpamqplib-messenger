@@ -49,3 +49,9 @@ parameters:
             identifier: class.notFound
             paths:
                 - tests/Unit/Transport/AmqpKeepaliveReceiverInterfaceTest.php
+        # Newer PHPUnit 12.5 releases mark mock with() as @no-named-arguments, but the
+        # tests use named arguments to match AMQPChannel's parameter names.
+        -
+            identifier: argument.named
+            paths:
+                - tests
