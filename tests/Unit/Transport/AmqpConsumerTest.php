@@ -26,6 +26,7 @@ use Psr\Log\LoggerInterface;
 use Symfony\Component\Messenger\Exception\TransportException;
 use Traversable;
 
+use function array_keys;
 use function array_shift;
 use function iterator_to_array;
 
@@ -696,6 +697,77 @@ class AmqpConsumerTest extends TestCase
         $consumer->ensureStarted('test_queue', 50);
 
         self::assertSame(['qos:20', 'consume', 'cancel', 'qos:50', 'consume'], $operations);
+    }
+
+    public function testResubscribingKeepsDeliveriesQueuedWhileCancelling(): void
+    {
+        // php-amqplib drops a consumer's callback on basic.cancel-ok, but a basic.deliver that
+        // arrived before it sits in the method queue and is dispatched by a later wait().
+        // The consumer must keep the callback registered until that queue is flushed.
+        $channel = $this->createMock(AMQPChannel::class);
+
+        $connection = $this->getTestConnectionStub();
+        $connection->method('consumerChannel')
+            ->willReturn($channel);
+
+        $consumer = $this->getTestConsumer(connection: $connection);
+
+        $channel->method('basic_consume')
+            ->willReturn('consumer_tag');
+        $channel->expects(self::once())
+            ->method('basic_cancel')
+            ->with('consumer_tag');
+
+        $registeredTags = static fn (): array => array_keys((fn (): array => $this->callbacks)->call($channel));
+
+        $channel->expects(self::exactly(2))
+            ->method('hasPendingMethods')
+            ->willReturnOnConsecutiveCalls(true, false);
+        $channel->expects(self::once())
+            ->method('wait')
+            ->willReturnCallback(static function () use ($channel, $registeredTags): void {
+                self::assertSame(['consumer_tag'], $registeredTags());
+
+                $message = new AMQPMessage('in-flight');
+                (fn () => ($this->callbacks['consumer_tag'])($message))->call($channel);
+            });
+
+        $consumer->ensureStarted('test_queue');
+        $consumer->ensureStarted('test_queue', 50);
+
+        self::assertTrue($consumer->hasBufferedEnvelopes());
+        // The temporary registration for the cancelled tag is removed again.
+        self::assertSame([], $registeredTags());
+    }
+
+    public function testResubscribingDoesNotSubscribeAgainWhenCancelFails(): void
+    {
+        $channel = $this->createMock(AMQPChannel::class);
+
+        $connection = $this->getTestConnectionStub();
+        $connection->method('consumerChannel')
+            ->willReturn($channel);
+
+        $consumer = $this->getTestConsumer(connection: $connection);
+
+        $channel->expects(self::once())
+            ->method('basic_consume')
+            ->willReturn('consumer_tag');
+        $channel->expects(self::exactly(2))
+            ->method('basic_cancel')
+            ->willThrowException(new AMQPTimeoutException());
+
+        $consumer->ensureStarted('test_queue');
+
+        for ($i = 0; $i < 2; $i++) {
+            try {
+                $consumer->ensureStarted('test_queue', 50);
+                self::fail('Expected the failed cancel to propagate');
+            } catch (AMQPTimeoutException) {
+                // The old subscription may still be live, so no second consumer is created
+                // and the next call retries the cancel.
+            }
+        }
     }
 
     public function testStopConsumer(): void

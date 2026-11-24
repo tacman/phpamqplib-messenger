@@ -33,10 +33,12 @@ use Symfony\Component\Messenger\Stamp\TransportMessageIdStamp;
 use Throwable;
 use Traversable;
 
+use function array_slice;
 use function assert;
 use function count;
 use function iterator_to_array;
 use function sprintf;
+use function usleep;
 
 class TransportFunctionalTest extends KernelTestCase
 {
@@ -361,6 +363,46 @@ class TransportFunctionalTest extends KernelTestCase
         } finally {
             // Delivery tags from before and after the change remain valid.
             foreach ($received as $envelope) {
+                $this->fetchSizeTransport->ack($envelope);
+            }
+        }
+    }
+
+    public function testResubscribingDoesNotLoseDeliveriesSentBeforeTheCancel(): void
+    {
+        for ($i = 1; $i <= 40; $i++) {
+            $this->fetchSizeTransport->send(Envelope::wrap(new ConfirmMessage($i)));
+        }
+
+        $connection = $this->fetchSizeTransport->getConnection();
+        $connection->reconnect();
+        $connection->startConsumers();
+
+        $received = [];
+        try {
+            foreach ($this->fetchSizeTransport->get(1) as $envelope) {
+                $received[] = $envelope;
+            }
+
+            self::assertCount(1, $received);
+
+            // Acking frees a prefetch slot, so the broker pushes another delivery that sits
+            // unread in the socket until the cancel below reads it ahead of basic.cancel-ok.
+            $this->fetchSizeTransport->ack($received[0]);
+            usleep(500_000);
+
+            for ($poll = 0; $poll < 30 && count($received) < 40; $poll++) {
+                foreach ($this->fetchSizeTransport->get(40) as $envelope) {
+                    $received[] = $envelope;
+                }
+            }
+
+            self::assertCount(40, $received);
+            foreach ($received as $index => $envelope) {
+                self::assertSame($index + 1, $this->messageCount($envelope));
+            }
+        } finally {
+            foreach (array_slice($received, 1) as $envelope) {
                 $this->fetchSizeTransport->ack($envelope);
             }
         }

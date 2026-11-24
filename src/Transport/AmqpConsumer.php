@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Jwage\PhpAmqpLibMessengerBundle\Transport;
 
+use Closure;
 use InvalidArgumentException;
 use Jwage\PhpAmqpLibMessengerBundle\Debug;
 use Jwage\PhpAmqpLibMessengerBundle\Transport\Config\ConnectionConfig;
@@ -178,7 +179,7 @@ class AmqpConsumer
             // RabbitMQ applies per-consumer QoS when basic_consume registers the
             // subscription. Updating basic_qos alone does not resize an existing one.
             // Keep this channel and its buffer so outstanding deliveries can still be acked.
-            $this->stop();
+            $this->cancelKeepingInFlightDeliveries($this->consumerTag);
         }
 
         if ($this->effectivePrefetchCount !== $desiredPrefetch || $this->consumerTag === null) {
@@ -203,6 +204,46 @@ class AmqpConsumer
     public function hasBufferedEnvelopes(): bool
     {
         return $this->buffer !== [];
+    }
+
+    /**
+     * Cancels the subscription without losing deliveries the broker already sent for it.
+     *
+     * basic_cancel() only waits for basic.cancel-ok, so php-amqplib queues any basic.deliver
+     * that arrives first and dispatches it on a later wait(). By then the cancel-ok handler
+     * has dropped the consumer's callback, so the delivery would be discarded: never
+     * buffered, never acked, and unacked on the channel until it closes. Re-register the
+     * callback for the cancelled tag just long enough to flush those queued deliveries
+     * into the buffer.
+     *
+     * Unlike stop(), a failed cancel is not swallowed: the subscription may still be live,
+     * and subscribing again would then create a duplicate consumer.
+     *
+     * @throws AMQPExceptionInterface
+     */
+    private function cancelKeepingInFlightDeliveries(string $consumerTag): void
+    {
+        $channel = $this->connection->consumerChannel();
+
+        $channel->basic_cancel(consumer_tag: $consumerTag);
+
+        $this->consumerTag            = null;
+        $this->effectivePrefetchCount = null;
+
+        // callbacks is protected in php-amqplib and has no public accessor, so run in
+        // the channel's scope.
+        (function (string $consumerTag, Closure $callback): void {
+            $this->callbacks[$consumerTag] = $callback;
+
+            try {
+                // Each wait() dispatches one queued method before reading from the socket.
+                while ($this->hasPendingMethods()) {
+                    $this->wait(null, true);
+                }
+            } finally {
+                unset($this->callbacks[$consumerTag]);
+            }
+        })->call($channel, $consumerTag, $this->callback(...));
     }
 
     /** @throws TransportException */
